@@ -71,37 +71,41 @@ const io = new Server(server, {
       if (!room.participants || room.participants.length === 0) {
         room.isStarted = false;
         await room.save();
-        io.to(roomId).emit("gameStatus", { isStarted: false, isActive: false });
         return;
       }
+
+      // If we wrapped around, increment round
+      if (room.currentTurnIndex === 0) room.maxRounds -= 1;
 
       // Advance turn index
       room.currentTurnIndex = (room.currentTurnIndex + 1) % room.participants.length;
 
-      // If we wrapped around, increment round
-      if (room.currentTurnIndex === 0) room.currentRound += 1;
-
       // ✅ Game over check
-      if (room.currentRound > room.maxRounds) {
-        room.isStarted = false;
-        room.isActive = false;
+      if (room.maxRounds <= 2) {
 
-        // Build leaderboard
-        room.leaderboard = (room.participants || [])
-          .map((p) => ({ username: p.username, score: p.score || 0 }))
-          .sort((a, b) => b.score - a.score);
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId: "1",
+              user: "",
+              message: "Game over!",
+            });
+            io.to(participant.socketId).emit("showResult", room);
+          }
+        }
 
-        await room.save();
-        io.to(roomId).emit("roomData", room);
-        io.to(roomId).emit("receiveMessage", { userId: "1", user: "", message: "Game over!" }); // Fixed: removed extra 'f'
+        // Delay cleanup by 12s (frontend shows result for 10s)
+        setTimeout(async () => {
+          await Chats.deleteOne({ roomCode: room.roomId });
+        }, 12000);
+
         return;
       }
 
       // ====== Fetch words from Chats model ======
       const room_code = await Rooms.findOne({ _id: roomId });
-      const chatDoc = await Chats.findOne({ roomCode: room_code.roomId });
 
-      let wordList = chatDoc?.words || [];
+      let wordList = room_code?.words || [];
 
       if (wordList.length > 0) {
         const randomIndex = Math.floor(Math.random() * wordList.length);
@@ -109,8 +113,8 @@ const io = new Server(server, {
 
         // Remove used word in Chats so it’s not repeated
         wordList.splice(randomIndex, 1);
-        chatDoc.words = wordList;
-        await chatDoc.save();
+        room_code.words = wordList;
+        await room_code.save();
       } else {
         room.currentWord = "current word";
       }
@@ -122,13 +126,17 @@ const io = new Server(server, {
       await room.save();
 
       // Broadcast new state
-      io.to(roomId).emit("roomData", room);
-      io.to(roomId).emit("gameStatus", { isStarted: true, isActive: true });
-      io.to(roomId).emit("receiveMessage", {
-        userId: "1",
-        user: "",
-        message: `It's ${currentDrawer?.username}'s turn to draw!`,
-      });
+      for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId: "1",
+              user: "",
+              message: `It's ${currentDrawer?.username}'s turn to draw!`,
+            });
+            io.to(participant.socketId).emit("roomData", room);
+            io.to(participant.socketId).emit("gotAnswer", false);
+          }
+        }
 
       // Start the round timer (unified approach)
       startRound(io, roomId);
@@ -154,19 +162,25 @@ const io = new Server(server, {
         const elapsed = Date.now() - startTime;
         const remaining = Math.max(totalTime - elapsed, 0);
 
-        io.to(roomId).emit("timerUpdate", Math.ceil(remaining / 1000));
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("timerUpdate", Math.ceil(remaining / 1000));
+          }
+        }
 
         // Round end
-        if (remaining <= 0) {
+        if (remaining <= 2) {
           clearRoomTimer(roomId);
-          io.to(roomId).emit("roundEnded");
           
           // Move to next turn after a short delay
 
           // 1. Clear canvas and Show the answer immediately
-          
-          io.to(roomId).emit("canvasCleared");
-          io.to(roomId).emit("showAnswer", true);
+          for (const participant of room.participants) {
+            if (participant.socketId) {
+              io.to(participant.socketId).emit("canvasCleared");
+              io.to(participant.socketId).emit("showAnswer", true);
+            }
+          }
 
           // 2. Wait for some time (e.g., 2 seconds)
           setTimeout(async() => {
@@ -176,7 +190,18 @@ const io = new Server(server, {
               { $set: { canvasChange: [] } }
             );
 
-            io.to(roomId).emit("showAnswer", false);
+          for (const participant of room.participants) {
+            if (participant.socketId) {
+              io.to(participant.socketId).emit("showAnswer",false);
+            }
+          }
+
+            const chatDoc = await Chats.findOne({ roomCode: room.roomId });
+            if (chatDoc) {
+              socket.emit("gotAnswer", true);
+              chatDoc.correctAnswers = [];
+              await chatDoc.save();
+            }
 
             // move to next turn
             nextTurn(io, roomId);
@@ -221,6 +246,17 @@ const io = new Server(server, {
             });
             await chatDoc.save();
           }
+
+          // ✅ Reward current drawer with 30% of delta
+          if (room.currentTurnUserId) {
+            const drawer = (room.participants || []).find(
+              (p) => toId(p.userId) === toId(room.currentTurnUserId)
+            );
+            if (drawer) {
+              const drawerBonus = Math.floor(delta * 0.2);
+              drawer.score = (drawer.score || 0) + drawerBonus;
+            }
+          }
         }
 
         // Update score
@@ -228,24 +264,34 @@ const io = new Server(server, {
 
         await room.save();
 
-        io.to(roomId).emit("scoreUpdate", room.leaderboard);
-        io.to(roomId).emit("roomData", room);
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("roomData", room);
+          }
+        }
 
       } catch (err) {
         console.error("submitAnswer error:", err);
       }
     });
 
-    // Start Game (host only in ideal case; here we don't enforce host, but you can)
     socket.on("startGame", async ({ roomId }) => {
       try {
         if (!roomId) return;
-        let room = await Rooms.findOne({ _id: roomId });
+        
+        const objectId = new mongoose.Types.ObjectId(roomId);
+        let room = await Rooms.findOne({ _id: objectId });
         if (!room) return;
 
-        if(room.participants.length < 2) {
-          socket.emit("errorMessage", "Atleast need 2 Playes to start");
+        if (room.participants.length < 2) {
+          socket.emit("errorMessage", "At least need 2 Players to start");
           return;
+        }
+
+        // ✅ FIXED: Clear any existing timers before starting
+        if (roundTimers[roomId]) {
+          clearInterval(roundTimers[roomId]);
+          delete roundTimers[roomId];
         }
 
         room.isStarted = true;
@@ -258,35 +304,48 @@ const io = new Server(server, {
         // Initialize leaderboard if it doesn't exist
         if (!room.leaderboard) room.leaderboard = [];
 
-        // ====== Fetch words from Chats model ======
-
-        const room_code = await Rooms.findOne({ _id: roomId });
-        const chatDoc = await Chats.findOne({ roomCode: room_code.roomId });
-
-        let wordList = chatDoc?.words || [];
-
-        if (wordList.length > 0) {
-          const randomIndex = Math.floor(Math.random() * wordList.length);
-          room.currentWord = wordList[randomIndex];
-
-          // Remove used word in Chats so it’s not repeated
-          wordList.splice(randomIndex, 1);
-          chatDoc.words = wordList;
-          await chatDoc.save();
-        } else {
-          room.currentWord = "";
-        }
+        // ✅ FIXED: Initialize scores for all participants
+        room.participants.forEach(participant => {
+          if (participant.score === undefined) {
+            participant.score = 0;
+          }
+        });
 
         // Assign current drawer
         const currentDrawer = room.participants[room.currentTurnIndex];
-        room.currentTurnUserId = currentDrawer?.userId; // Fixed: added optional chaining
-        room.isStarted = true;
-        room.isActive = true;
+        room.currentTurnUserId = currentDrawer?.userId;
+
+        // ✅ FIXED: Set initial word
+        const room_code = await Rooms.findOne({ _id: objectId });
+        let wordList = room_code?.words || [];
+        if (wordList.length > 0) {
+          const randomIndex = Math.floor(Math.random() * wordList.length);
+          room.currentWord = wordList[randomIndex];
+          // Remove used word
+          wordList.splice(randomIndex, 1);
+          room_code.words = wordList;
+          await room_code.save();
+        } else {
+          room.currentWord = "current word";
+        }
 
         await room.save();
 
-        // Broadcast updated room to everyone
-        io.to(roomId).emit("roomData", room);
+        // ✅ FIXED: Broadcast to ALL users in the room
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("roomData", room);
+          }
+        }
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId: "1",
+              user: "",
+              message: `It's ${currentDrawer?.username}'s turn to draw!`,
+            });
+          }
+        }
 
         // Start the first round
         startRound(io, roomId);
@@ -318,20 +377,25 @@ const io = new Server(server, {
         );
 
         if (!isExist) {
-    // New participant
-    await Rooms.updateOne(
-        { _id: objectId },
-        { $push: {
-            participants: { userId, username, score: 0, socketId: socket.id } 
+        // New participant
+        await Rooms.updateOne(
+            { _id: objectId },
+            { $push: {
+                participants: { userId, username, score: 0, socketId: socket.id } 
+              }
+            }
+        );
+
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId: "1",
+              user: "",
+              message: `${username} joined the room`,
+            });
           }
         }
-    );
 
-    io.to(roomId).emit("receiveMessage", {
-        userId: "1",
-        user: "",
-        message: `${username} joined the room`,
-    });
         } else {
             // User already exists → just update socketId
             await Rooms.updateOne(
@@ -343,23 +407,27 @@ const io = new Server(server, {
         // Get fresh room data
         room = await Rooms.findOne({ _id: objectId });
 
-        // Fetch chat history
         const room_code = await Rooms.findOne({ _id: objectId });
+        let chatDoc = await Chats.findOne({ roomCode: room_code.roomId });
 
-        let chatDoc = await Chats.findOne({ roomCode: room_code.roomId })
+        // ✅ FIXED: Send updated room + chat history to the new user
+        socket.emit("roomData", room_code);
+        if (chatDoc) {
+          socket.emit("chatHistory", chatDoc.chats);
+          socket.emit("canvasHistory", chatDoc.canvasChange);
+        }
 
-        // Send updated room + chat history to the new user
-        socket.emit("roomData", room);
-        socket.emit("chatHistory", chatDoc.chats);
-        socket.emit("canvasHistory", chatDoc.canvasChange);
+        // 🚀 Brute force: send roomData to EACH participant individually
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("roomData", room);
+          }
+        }
 
-        // Broadcast updated room to everyone else
-        io.to(roomId).emit("roomData", room);
-
-    } catch (err) {
-        console.error("joinRoom error:", err);
-        socket.emit("errorMessage", "Failed to join room");
-    }
+        } catch (err) {
+            console.error("joinRoom error:", err);
+            socket.emit("errorMessage", "Failed to join room");
+        }
     });
 
     // Drawing event
@@ -438,11 +506,16 @@ const io = new Server(server, {
         );
 
         // Emit new message to room
-        io.to(roomId).emit("receiveMessage", {
-        userId,
-        user,
-        message,
-        });
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId,
+              user,
+              message,
+            });
+          }
+        }
+
     } catch (err) {
         console.error("sendChat error:", err);
         socket.emit("errorMessage", "Failed to send message");
@@ -461,20 +534,18 @@ const io = new Server(server, {
         const uid = toId(userId);
         room.participants = (room.participants || []).filter((p) => toId(p.userId) !== uid);
 
-      //   //If host left, reassign first participant as host
-      //   if (!room.participants.some((p) => p.isHost) && room.participants.length > 0) {
-      //     return ;
-      //   }
-
         await room.save();
 
-        io.to(roomId).emit("roomData", room);
-        // Broadcast system join message
-          io.to(roomId).emit("receiveMessage", {
-          userId: "1",
-          user: "",
-          message: `${username} left the room`,
-          });
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", {
+              userId: "1",
+              user: "",
+              message: `${username} left the room`,
+            });
+          }
+        }
+
       } catch (err) {
         console.error("leaveRoom error:", err);
         socket.emit("errorMessage", "Failed to leave room");
@@ -492,9 +563,12 @@ const io = new Server(server, {
         );
         if (!room) return;
 
-        io.to(roomId).emit("gameStatus", { isStarted: false, isActive: false });
-        io.to(roomId).emit("receiveMessage", { userId: "1", user: "", text: "Game has ended" });
-        io.to(roomId).emit("roomData", room);
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", { userId: "1", user: "", text: "Game has ended" });
+            io.to(participant.socketId).emit("showResult", room);
+          }
+        }
       } catch (err) {
         console.error("endGame error:", err);
         socket.emit("errorMessage", "Failed to end game");
@@ -508,5 +582,5 @@ const io = new Server(server, {
 
 // ===== Start Server =====
 server.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  // console.log(`Server running on port ${port}`);
 });

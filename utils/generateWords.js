@@ -3,6 +3,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const generateWords = async (difficultyLevel, wordCategory) => {
+
   try {
     // sanitize category
     const invalidCategories = ["toxic", "sexual", "irrelevant"];
@@ -23,7 +24,7 @@ const generateWords = async (difficultyLevel, wordCategory) => {
       Example: ["apple", "New York", "Golden Gate", ...]
       `;
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
     const result = await model.generateContent(prompt);
 
     let text = result.response.text();

@@ -68,8 +68,10 @@ const roomSchema = new mongoose.Schema(
       },
     ],
 
-    words : {
-      type: String,
+    words: {
+      type: [String],   // array of strings
+      required: true,
+      default: [],
     },
 
     // NEW: game status
@@ -79,6 +81,11 @@ const roomSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+
+    maxRounds: {
+      type: Number,
+      default: 3,
+    }
 
   },
   { timestamps: true }
