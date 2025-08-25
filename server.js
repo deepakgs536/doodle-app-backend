@@ -43,6 +43,7 @@ const io = new Server(server, {
     const Rooms = require("./models/roomModel");
     const Chats = require("./models/chatModel");
     const mongoose = require("mongoose");
+const { generateWords } = require("./utils/generateWords");
 
     // ===== SINGLE Socket.IO Connection Block =====
     io.on("connection", (socket) => {
@@ -314,6 +315,15 @@ const io = new Server(server, {
         // Assign current drawer
         const currentDrawer = room.participants[room.currentTurnIndex];
         room.currentTurnUserId = currentDrawer?.userId;
+
+        const generatedWords = await generateWords(difficultyLevel, wordCategory);
+
+        // Update the words of a room by roomId
+        const updatedRoom = await Rooms.findOneAndUpdate(
+          { _id: objectId },                // Filter: find the room by roomId
+          { $set: { words: generatedWords } }, // Only update words
+          { new: true }              // Return the updated document
+        );
 
         // ✅ FIXED: Set initial word
         const room_code = await Rooms.findOne({ _id: objectId });

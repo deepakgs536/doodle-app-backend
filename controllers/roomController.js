@@ -11,7 +11,6 @@ const createRoom = asyncHandler(async (req, res) => {
   const roomId = await generateRoomId();
 
   // 2. Create chat document with initial system message
-  const generatedWords = await generateWords(difficultyLevel, wordCategory);
 
   const newRoom = await Rooms.create({
     roomId,
@@ -20,7 +19,7 @@ const createRoom = asyncHandler(async (req, res) => {
     roundDuration,
     wordCategory,
     participants: [],
-    words: generatedWords,
+    words: [],
     hostId: user._id,
   });
 
