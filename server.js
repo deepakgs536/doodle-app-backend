@@ -316,7 +316,9 @@ const { generateWords } = require("./utils/generateWords");
         const currentDrawer = room.participants[room.currentTurnIndex];
         room.currentTurnUserId = currentDrawer?.userId;
 
-        const generatedWords = await generateWords(difficultyLevel, wordCategory);
+        const wordCount = (room.participants.length || 20) + 2;
+
+        const generatedWords = await generateWords(difficultyLevel, wordCategory, wordCount);
 
         // Update the words of a room by roomId
         const updatedRoom = await Rooms.findOneAndUpdate(
