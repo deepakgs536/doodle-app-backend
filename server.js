@@ -518,7 +518,7 @@ const { generateWords } = require("./utils/generateWords");
         );
 
         // Emit new message to room
-        for (const participant of room.participants) {
+        for (const participant of room_code.participants) {
           if (participant.socketId) {
             io.to(participant.socketId).emit("receiveMessage", {
               userId,
