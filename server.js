@@ -16,7 +16,7 @@ const port = process.env.PORT || 5000;
 
 // ===== Express Middlewares =====
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+  origin: process.env.CORS_ORIGIN,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   credentials: true,
 }));
@@ -33,7 +33,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+    origin: process.env.CORS_ORIGIN,
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -43,7 +43,22 @@ const io = new Server(server, {
     const Rooms = require("./models/roomModel");
     const Chats = require("./models/chatModel");
     const mongoose = require("mongoose");
-const { generateWords } = require("./utils/generateWords");
+    const { generateWords } = require("./utils/generateWords");
+
+    // ---- Global round state (shared across all sockets) ----
+    const roundTimers = new Map();     // key: roomId string -> setInterval handle
+    const roundEnding = new Set();     // key: roomId string -> lock to avoid double end
+
+    const keyOf = (id) => id?.toString?.() || String(id);
+
+    function clearRoomTimer(roomId) {
+      const k = keyOf(roomId);
+      const t = roundTimers.get(k);
+      if (t) {
+        clearInterval(t);
+        roundTimers.delete(k);
+      }
+    }
 
     // ===== SINGLE Socket.IO Connection Block =====
     io.on("connection", (socket) => {
@@ -51,165 +66,147 @@ const { generateWords } = require("./utils/generateWords");
     // Safely stringify ObjectId-like values
     const toId = (v) => (v && typeof v === "object" && v.toString ? v.toString() : String(v || ""));
 
-    const roundTimers = {};
+    async function startRound(io, roomId) {
+      const k = keyOf(roomId);
+      const room = await Rooms.findOne({ _id: roomId });
+      if (!room) return;
 
-    // Utility to clear any existing timer for a room
-    function clearRoomTimer(roomId) {
-      if (roundTimers[roomId]) {
-        clearInterval(roundTimers[roomId]);
-        delete roundTimers[roomId];
+      // start timestamp & round token (guards against stale intervals)
+      const startTime = Date.now();
+      const totalTime = room.roundDuration * 1000;
+      room.roundStartTime = startTime;
+      // optional: round token to detect stale enders
+      room.roundToken = String(startTime);
+      await room.save();
+
+      clearRoomTimer(k);
+
+      const handle = setInterval(async () => {
+        const elapsed = Date.now() - startTime;
+        const remaining = Math.max(totalTime - elapsed, 0);
+
+        for (const p of room.participants) {
+          if (p.socketId) io.to(p.socketId).emit("timerUpdate", Math.ceil(remaining / 1000));
+        }
+
+        if (remaining <= 0) {
+          await endCurrentRound(io, roomId);
+        }
+      }, 1000);
+
+      roundTimers.set(k, handle);
+        }
+
+    async function endCurrentRound(io, roomId) {
+      const k = keyOf(roomId);
+
+      // prevent double execution
+      if (roundEnding.has(k)) return;
+      roundEnding.add(k);
+
+      try {
+        clearRoomTimer(k);
+
+        const room = await Rooms.findOne({ _id: roomId });
+        if (!room) return;
+
+        // 1) Reveal answer & clear canvas on clients
+        for (const p of room.participants) {
+          if (p.socketId) {
+            io.to(p.socketId).emit("canvasCleared");
+            io.to(p.socketId).emit("showAnswer", true);
+          }
+        }
+
+        // 2) Small pause then cleanup & next turn
+        setTimeout(async () => {
+          await Chats.updateOne(
+            { roomCode: room.roomId },
+            { $set: { canvasChange: [] } }
+          );
+
+          for (const p of room.participants) {
+            if (p.socketId) io.to(p.socketId).emit("showAnswer", false);
+          }
+
+          const chatDoc = await Chats.findOne({ roomCode: room.roomId });
+          if (chatDoc) {
+            chatDoc.correctAnswers = [];
+            await chatDoc.save();
+          }
+
+          await nextTurn(io, roomId);
+        }, 5000);
+      } finally {
+        roundEnding.delete(k);
       }
     }
 
     async function nextTurn(io, roomId) {
+      // IMPORTANT: this runs outside socket scope; same code as yours but keep:
+      // - call clearRoomTimer(roomId) first
+      // - at the very end call startRound(io, roomId)
       let room = await Rooms.findOne({ _id: roomId });
       if (!room || !room.isStarted) return;
 
-      // Clear any existing timer first
       clearRoomTimer(roomId);
 
-      // Guard against empty participants
       if (!room.participants || room.participants.length === 0) {
         room.isStarted = false;
         await room.save();
         return;
       }
 
-      // If we wrapped around, increment round
       if (room.currentTurnIndex === 0) room.maxRounds -= 1;
 
-      // Advance turn index
       room.currentTurnIndex = (room.currentTurnIndex + 1) % room.participants.length;
 
-      // ✅ Game over check
       if (room.maxRounds <= 0) {
-
-        for (const participant of room.participants) {
-          if (participant.socketId) {
-            io.to(participant.socketId).emit("receiveMessage", {
-              userId: "1",
-              user: "",
-              message: "Game over!",
-            });
-            io.to(participant.socketId).emit("showResult", room);
+        for (const p of room.participants) {
+          if (p.socketId) {
+            io.to(p.socketId).emit("receiveMessage", { userId: "1", user: "", message: "Game over!" });
+            io.to(p.socketId).emit("showResult", room);
           }
         }
-
-        // Delay cleanup by 12s (frontend shows result for 10s)
-        setTimeout(async () => {
-          await Chats.deleteOne({ roomCode: room.roomId });
-        }, 12000);
-
+        setTimeout(async () => { await Chats.deleteOne({ roomCode: room.roomId }); }, 12000);
         return;
       }
 
-      // ====== Fetch words from Chats model ======
-      const room_code = await Rooms.findOne({ _id: roomId });
-
-      let wordList = room_code?.words || [];
+      // ====== Fetch new word ======
+      let wordList = room.words || [];
 
       if (wordList.length > 0) {
         const randomIndex = Math.floor(Math.random() * wordList.length);
         room.currentWord = wordList[randomIndex];
 
-        // Remove used word in Chats so it’s not repeated
+        // Remove used word so it’s not repeated
         wordList.splice(randomIndex, 1);
-        room_code.words = wordList;
-        await room_code.save();
+        room.words = wordList;
       } else {
-        room.currentWord = "current word";
+        for (const participant of room.participants) {
+          if (participant.socketId) {
+            io.to(participant.socketId).emit("receiveMessage", { userId: "1", user: "", text: "Game has ended" });
+            io.to(participant.socketId).emit("showResult", room);
+          }
+        }
       }
 
-      // Assign current drawer
+      // word selection (same as yours) ...
+
       const currentDrawer = room.participants[room.currentTurnIndex];
       room.currentTurnUserId = currentDrawer?.userId || null;
 
       await room.save();
 
-      // Broadcast new state
-      for (const participant of room.participants) {
-          if (participant.socketId) {
-            io.to(participant.socketId).emit("receiveMessage", {
-              userId: "1",
-              user: "",
-              message: `It's ${currentDrawer?.username}'s turn to draw!`,
-            });
-            io.to(participant.socketId).emit("roomData", room);
-            io.to(participant.socketId).emit("gotAnswer", false);
-          }
+      for (const p of room.participants) {
+        if (p.socketId) {
+          io.to(p.socketId).emit("receiveMessage", { userId: "1", user: "", message: `It's ${currentDrawer?.username}'s turn to draw!` });
+          io.to(p.socketId).emit("roomData", room);
+          io.to(p.socketId).emit("gotAnswer", false);
         }
+      }
 
-      // Start the round timer (unified approach)
-      startRound(io, roomId);
-    }
-
-    // Utility to start a round with timer
-    async function startRound(io, roomId) {
-      const room = await Rooms.findOne({ _id: roomId }); // Fixed: use _id instead of roomId
-      
-      if (!room) return;
-
-      const totalTime = room.roundDuration * 1000;
-      const startTime = Date.now();
-
-      room.roundStartTime = startTime;
-      await room.save();
-
-      // Clear any existing timer
-      clearRoomTimer(roomId);
-
-      // Broadcast countdown every second
-      roundTimers[roomId] = setInterval(async () => {
-        const elapsed = Date.now() - startTime;
-        const remaining = Math.max(totalTime - elapsed, 0);
-
-        for (const participant of room.participants) {
-          if (participant.socketId) {
-            io.to(participant.socketId).emit("timerUpdate", Math.ceil(remaining / 1000));
-          }
-        }
-
-        // Round end
-        if (remaining <= 2) {
-          clearRoomTimer(roomId);
-          
-          // Move to next turn after a short delay
-
-          // 1. Clear canvas and Show the answer immediately
-          for (const participant of room.participants) {
-            if (participant.socketId) {
-              io.to(participant.socketId).emit("canvasCleared");
-              io.to(participant.socketId).emit("showAnswer", true);
-            }
-          }
-
-          // 2. Wait for some time (e.g., 2 seconds)
-          setTimeout(async() => {
-            // hide answer
-            await Chats.updateOne(
-              { roomCode: room.roomId },
-              { $set: { canvasChange: [] } }
-            );
-
-          for (const participant of room.participants) {
-            if (participant.socketId) {
-              io.to(participant.socketId).emit("showAnswer",false);
-            }
-          }
-
-            const chatDoc = await Chats.findOne({ roomCode: room.roomId });
-            if (chatDoc) {
-              socket.emit("gotAnswer", true);
-              chatDoc.correctAnswers = [];
-              await chatDoc.save();
-            }
-
-            // move to next turn
-            nextTurn(io, roomId);
-          }, 5000); // adjust duration as needed
-
-        }
-      }, 1000);
+      await startRound(io, roomId);
     }
 
     socket.on("submitAnswer", async ({ roomId, userId, answer }) => {
@@ -245,9 +242,14 @@ const { generateWords } = require("./utils/generateWords");
               userId,
               timestamp: new Date(),
             });
-            await chatDoc.save();
-          }
 
+          await chatDoc.save();
+          
+          if(chatDoc.correctAnswers.length >= room.participants.length - 1){
+            clearRoomTimer(roomId); // prevent old timer from firing
+            endCurrentRound(io, roomId, room); // Use roomId, not room.roomId
+          }
+        }
           // ✅ Reward current drawer with 30% of delta
           if (room.currentTurnUserId) {
             const drawer = (room.participants || []).find(
@@ -316,9 +318,10 @@ const { generateWords } = require("./utils/generateWords");
         const currentDrawer = room.participants[room.currentTurnIndex];
         room.currentTurnUserId = currentDrawer?.userId;
 
-        const wordCount = (room.participants.length || 20) + 2;
+        const wordCount = ((room.participants.length * 3) || 20) + 2;
 
         const generatedWords = await generateWords(room.difficultyLevel, room.wordCategory, wordCount);
+        console.log(generatedWords);
 
         // Update the words of a room by roomId
         const updatedRoom = await Rooms.findOneAndUpdate(
@@ -338,7 +341,12 @@ const { generateWords } = require("./utils/generateWords");
           room_code.words = wordList;
           await room_code.save();
         } else {
-          room.currentWord = "current word";
+          for (const participant of room.participants) {
+            if (participant.socketId) {
+              io.to(participant.socketId).emit("receiveMessage", { userId: "1", user: "", text: "Game has ended" });
+              io.to(participant.socketId).emit("showResult", room);
+            }
+          }
         }
 
         await room.save();

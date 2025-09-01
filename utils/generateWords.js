@@ -11,22 +11,19 @@ const generateWords = async (difficultyLevel, wordCategory, wordCount) => {
       wordCategory = "common words";
     }
 
-    const prompt = 
-      `
-      Generate ${wordCount} unique English words or phrases for a word guessing game.  
+    const prompt = `
+      Generate ${wordCount} unique and commonly recognized English words or multi-word phrases for a word guessing game.
 
-      Rules:  
-      - Each entry must have at least 4 total letters (excluding spaces).  
-      - Entries can be either:  
-        • a single word (e.g., "apple"), OR  
-        • a multi-word proper name/phrase (e.g., "new york", "golden gate").  
-      - Only return actual valid entries within the category, not generic terms.  
-      - Difficulty level: ${difficultyLevel}.  
-      - Category: ${wordCategory}.  
-      - All entries must be strictly in lowercase.  
-      - Do not include explanations, just return the words/phrases in a clean JSON array format.  
+      Rules:
+      - Category: ${wordCategory}.
+      - Difficulty level: ${difficultyLevel}.
+      - Each entry must be a complete, meaningful name or phrase that people commonly and popularly know (not just partial or generic words).
+      - Minimum 4 characters (excluding spaces).
+      - Return only a clean JSON array of lowercase strings.
+      - Do not include explanations, numbering, or extra text.
 
-      Example: ["iron man", "captain america", "black panther", "doctor strange", ...]
+      Example:
+      ["jurassic park", "chicken biryani", "grand theft auto", "naruto uzumaki"]
       `;
 
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
