@@ -16,7 +16,7 @@ const port = process.env.PORT || 5000;
 
 // ===== Express Middlewares =====
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+  origin: "http://localhost:5173",
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   credentials: true,
 }));
@@ -33,7 +33,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:5173",
+    origin: "http://localhost:5173",
     methods: ["GET", "POST"],
     credentials: true,
   },
@@ -318,7 +318,7 @@ const { generateWords } = require("./utils/generateWords");
 
         const wordCount = (room.participants.length || 20) + 2;
 
-        const generatedWords = await generateWords(difficultyLevel, wordCategory, wordCount);
+        const generatedWords = await generateWords(room.difficultyLevel, room.wordCategory, wordCount);
 
         // Update the words of a room by roomId
         const updatedRoom = await Rooms.findOneAndUpdate(
