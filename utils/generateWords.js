@@ -29,7 +29,7 @@ const generateWords = async (difficultyLevel, wordCategory, wordCount) => {
       Example: ["iron man", "captain america", "black panther", "doctor strange", ...]
       `;
 
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-pro" });
     const result = await model.generateContent(prompt);
 
     let text = result.response.text();
