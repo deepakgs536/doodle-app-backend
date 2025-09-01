@@ -82,7 +82,7 @@ const { generateWords } = require("./utils/generateWords");
       room.currentTurnIndex = (room.currentTurnIndex + 1) % room.participants.length;
 
       // ✅ Game over check
-      if (room.maxRounds <= 2) {
+      if (room.maxRounds <= 0) {
 
         for (const participant of room.participants) {
           if (participant.socketId) {
